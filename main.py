@@ -1,9 +1,11 @@
 """
-NISAR Backend API.
+NISAR Backend API v2.
 - /search: find NISAR scenes for a location and date range.
-- /analyze: download a GUNW scene, process it, return interferogram PNG.
+- /analyze: start async download+processing, return job_id.
+- /status/{job_id}: check job progress.
+- /image/{job_id}: get resulting PNG.
 """
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import asf_search as asf
@@ -15,8 +17,14 @@ import matplotlib.pyplot as plt
 import os
 import tempfile
 import traceback
+import threading
+import uuid
+import requests
 
 app = FastAPI(title="NISAR Backend")
+
+# In-memory job store: job_id -> {status, image_path, error, scene_name}
+JOBS = {}
 
 
 class AnalyzeRequest(BaseModel):
@@ -28,7 +36,7 @@ class AnalyzeRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "NISAR Backend", "version": "1.1"}
+    return {"status": "ok", "service": "NISAR Backend", "version": "2.0"}
 
 
 @app.post("/search")
@@ -59,43 +67,33 @@ def search_scenes(req: AnalyzeRequest):
 
 def process_gunw(h5path: str, outpath: str) -> dict:
     """Open a GUNW HDF5 file and build the interferogram figure."""
-    # Try both possible GUNW paths (frequency A and B)
-    possible_paths = [
-        "science/LSAR/GUNW/grids/frequencyA/unwrappedInterferogram/HH/unwrappedPhase",
-        "science/LSAR/GUNW/grids/frequencyA/unwrappedInterferogram/HH/coherenceMagnitude",
-    ]
+    phase = None
+    coh = None
 
     with h5py.File(h5path, "r") as f:
-        # Find unwrappedPhase dataset
-        phase = None
-        coh = None
-        for key in f.keys():
-            pass
-
-        # Walk the tree to find unwrappedPhase
         def find_datasets(name, obj):
             nonlocal phase, coh
             if isinstance(obj, h5py.Dataset):
                 if "unwrappedPhase" in name and phase is None:
                     phase = obj[:]
+                    print(f"[process] Found phase dataset: {name} shape={obj.shape}", flush=True)
                 if "coherenceMagnitude" in name and coh is None:
                     coh = obj[:]
+                    print(f"[process] Found coherence dataset: {name} shape={obj.shape}", flush=True)
         f.visititems(find_datasets)
 
-        if phase is None:
-            raise ValueError("No unwrappedPhase dataset found in file")
+    if phase is None:
+        raise ValueError("No unwrappedPhase dataset found in file")
 
-        phase = np.array(phase, dtype=np.float32)
-        if coh is not None:
-            coh = np.array(coh, dtype=np.float32)
+    phase = np.array(phase, dtype=np.float32)
+    if coh is not None:
+        coh = np.array(coh, dtype=np.float32)
 
-    # Convert phase to displacement (L-band, wavelength 24 cm)
     wavelength_cm = 24.0
     disp = phase * wavelength_cm / (4 * np.pi)
 
     vmin, vmax = np.nanpercentile(disp, [2, 98])
 
-    # Build figure
     if coh is not None:
         fig, axes = plt.subplots(1, 3, figsize=(20, 7))
     else:
@@ -137,9 +135,56 @@ def process_gunw(h5path: str, outpath: str) -> dict:
     }
 
 
+def run_analysis(job_id: str, scene, tmpdir: str, user: str, pwd: str):
+    """Background worker: download + process + save PNG."""
+    try:
+        scene_name = scene.properties.get("sceneName", "scene")
+        url = scene.properties.get("url", "")
+        print(f"[job {job_id}] Starting: {scene_name}", flush=True)
+        print(f"[job {job_id}] URL: {url}", flush=True)
+
+        if not url:
+            raise ValueError("Scene has no URL in properties")
+
+        # Download directly with requests + auth
+        h5path = os.path.join(tmpdir, scene_name + ".h5")
+        print(f"[job {job_id}] Downloading via requests...", flush=True)
+
+        with requests.get(url, auth=(user, pwd), stream=True, timeout=600) as r:
+            print(f"[job {job_id}] HTTP status: {r.status_code}", flush=True)
+            r.raise_for_status()
+            total = 0
+            with open(h5path, "wb") as fout:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        fout.write(chunk)
+                        total += len(chunk)
+                        if total % (50 * 1024 * 1024) < (1024 * 1024):
+                            print(f"[job {job_id}] Downloaded {total / 1e6:.1f} MB", flush=True)
+
+        print(f"[job {job_id}] Download complete: {total / 1e6:.1f} MB", flush=True)
+
+        # Process
+        outpath = os.path.join(tmpdir, "interferogram.png")
+        stats = process_gunw(h5path, outpath)
+        print(f"[job {job_id}] Processing done: {stats}", flush=True)
+
+        JOBS[job_id]["status"] = "done"
+        JOBS[job_id]["image_path"] = outpath
+        JOBS[job_id]["scene_name"] = scene_name
+        JOBS[job_id]["stats"] = stats
+
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"[job {job_id}] ERROR: {err}", flush=True)
+        print(f"[job {job_id}] TRACE: {traceback.format_exc()}", flush=True)
+        JOBS[job_id]["status"] = "error"
+        JOBS[job_id]["error"] = err
+
+
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
-    """Download a NISAR GUNW scene and return an interferogram PNG."""
+    """Start async analysis. Returns job_id immediately."""
     try:
         point_wkt = f"POINT({req.lon} {req.lat})"
         results = asf.search(
@@ -157,34 +202,60 @@ def analyze(req: AnalyzeRequest):
         scene = results[0]
         scene_name = scene.properties.get("sceneName", "scene")
 
-        tmpdir = tempfile.mkdtemp()
-        print(f"Downloading {scene_name}...")
-
-        # Authenticate if credentials provided in env
         user = os.getenv("EARTHDATA_USERNAME")
         pwd = os.getenv("EARTHDATA_PASSWORD")
-        if user and pwd:
-            session = asf.ASFSession().auth_with_creds(user, pwd)
-        else:
-            session = asf.ASFSession()
+        if not user or not pwd:
+            return {"error": "EARTHDATA_USERNAME / EARTHDATA_PASSWORD not set"}
 
-        files = scene.download(path=tmpdir, session=session)
-        if not files:
-            return {"error": "Download failed"}
+        tmpdir = tempfile.mkdtemp()
+        job_id = str(uuid.uuid4())[:8]
 
-        h5path = files[0]
-        outpath = os.path.join(tmpdir, "interferogram.png")
+        JOBS[job_id] = {
+            "status": "processing",
+            "scene_name": scene_name,
+            "image_path": None,
+            "error": None,
+        }
 
-        stats = process_gunw(h5path, outpath)
+        thread = threading.Thread(
+            target=run_analysis,
+            args=(job_id, scene, tmpdir, user, pwd),
+            daemon=True,
+        )
+        thread.start()
 
-        return FileResponse(outpath, media_type="image/png",
-                            headers={
-                                "X-Scene-Name": scene_name,
-                                "X-Phase-Min": str(stats["phase_min"]),
-                                "X-Phase-Max": str(stats["phase_max"]),
-                                "X-Disp-Min-Cm": str(stats["disp_min_cm"]),
-                                "X-Disp-Max-Cm": str(stats["disp_max_cm"]),
-                            })
+        return {
+            "job_id": job_id,
+            "status": "processing",
+            "scene_name": scene_name,
+            "message": "Analysis started. Poll /status/{job_id}.",
+        }
 
     except Exception as e:
         return {"error": str(e), "trace": traceback.format_exc()}
+
+
+@app.get("/status/{job_id}")
+def job_status(job_id: str):
+    """Check status of an analysis job."""
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = JOBS[job_id]
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "scene_name": job.get("scene_name"),
+        "error": job.get("error"),
+        "stats": job.get("stats"),
+    }
+
+
+@app.get("/image/{job_id}")
+def job_image(job_id: str):
+    """Return the resulting PNG."""
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = JOBS[job_id]
+    if job["status"] != "done":
+        raise HTTPException(status_code=400, detail=f"Job status: {job['status']}")
+    return FileResponse(job["image_path"], media_type="image/png")
