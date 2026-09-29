@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+asf_search
+h5py
+numpy
+matplotlib
+pydantic
+requests
