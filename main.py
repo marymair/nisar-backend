@@ -1,14 +1,10 @@
 """
 NISAR Backend API.
-Receives coordinates and dates, searches NISAR scenes on NASA Earthdata,
-downloads data, processes it, and returns the interferogram.
+Receives coordinates and dates, searches NISAR scenes on NASA Earthdata.
 """
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI
 from pydantic import BaseModel
 import asf_search as asf
-import os
-import tempfile
 import traceback
 
 app = FastAPI(title="NISAR Backend")
@@ -17,8 +13,8 @@ app = FastAPI(title="NISAR Backend")
 class AnalyzeRequest(BaseModel):
     lat: float
     lon: float
-    start_date: str   # "2026-09-01"
-    end_date: str     # "2026-09-28"
+    start_date: str
+    end_date: str
 
 
 @app.get("/")
@@ -32,7 +28,7 @@ def search_scenes(req: AnalyzeRequest):
     try:
         point_wkt = f"POINT({req.lon} {req.lat})"
         results = asf.search(
-            dataset="NISAR",
+            platform=asf.PLATFORM.NISAR,
             intersectsWith=point_wkt,
             start=f"{req.start_date}T00:00:00Z",
             end=f"{req.end_date}T23:59:59Z",
@@ -46,7 +42,6 @@ def search_scenes(req: AnalyzeRequest):
                 "name": p.get("sceneName", "unknown"),
                 "date": p.get("startTime", "unknown"),
                 "level": p.get("processingLevel", "unknown"),
-                "size_mb": p.get("bytes", 0) / 1e6 if isinstance(p.get("bytes"), (int, float)) else None,
                 "url": p.get("url", ""),
             })
 
