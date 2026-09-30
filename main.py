@@ -1,5 +1,6 @@
 """
-NISAR Backend API v2.1 — uses asf_search for authenticated download.
+NISAR Backend API v2.2 — uses asf_search for authenticated download,
+with filesystem scan fallback.
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -30,7 +31,7 @@ class AnalyzeRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "NISAR Backend", "version": "2.1"}
+    return {"status": "ok", "service": "NISAR Backend", "version": "2.2"}
 
 
 @app.post("/search")
@@ -140,14 +141,21 @@ def run_analysis(job_id, scene, tmpdir, user, pwd):
             raise
 
         print(f"[job {job_id}] Downloading via scene.download()...", flush=True)
-        files = scene.download(path=tmpdir, session=session)
-        print(f"[job {job_id}] download returned: {files}", flush=True)
+        try:
+            scene.download(path=tmpdir, session=session)
+        except Exception as dl_e:
+            print(f"[job {job_id}] download() raised: {dl_e}", flush=True)
+            raise
 
-        if not files:
-            raise RuntimeError("scene.download() returned empty list")
+        # Scan the directory for any downloaded .h5 file
+        downloaded_files = [f for f in os.listdir(tmpdir) if f.endswith(".h5")]
+        print(f"[job {job_id}] files in {tmpdir}: {downloaded_files}", flush=True)
 
-        h5path = files[0] if isinstance(files, list) else files
-        print(f"[job {job_id}] downloaded to: {h5path}", flush=True)
+        if not downloaded_files:
+            raise RuntimeError(f"No .h5 file found in {tmpdir} after download")
+
+        h5path = os.path.join(tmpdir, downloaded_files[0])
+        print(f"[job {job_id}] using file: {h5path}", flush=True)
 
         outpath = os.path.join(tmpdir, "interferogram.png")
         stats = process_gunw(h5path, outpath)
