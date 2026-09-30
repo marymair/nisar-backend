@@ -1,9 +1,5 @@
 """
-NISAR Backend API v2.
-- /search: find NISAR scenes for a location and date range.
-- /analyze: start async download+processing, return job_id.
-- /status/{job_id}: check job progress.
-- /image/{job_id}: get resulting PNG.
+NISAR Backend API v2.1 — uses asf_search for authenticated download.
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -19,11 +15,9 @@ import tempfile
 import traceback
 import threading
 import uuid
-import requests
 
 app = FastAPI(title="NISAR Backend")
 
-# In-memory job store: job_id -> {status, image_path, error, scene_name}
 JOBS = {}
 
 
@@ -36,12 +30,11 @@ class AnalyzeRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "NISAR Backend", "version": "2.0"}
+    return {"status": "ok", "service": "NISAR Backend", "version": "2.1"}
 
 
 @app.post("/search")
 def search_scenes(req: AnalyzeRequest):
-    """Search NISAR scenes for given coordinates and dates."""
     try:
         point_wkt = f"POINT({req.lon} {req.lat})"
         results = asf.search(
@@ -66,7 +59,6 @@ def search_scenes(req: AnalyzeRequest):
 
 
 def process_gunw(h5path: str, outpath: str) -> dict:
-    """Open a GUNW HDF5 file and build the interferogram figure."""
     phase = None
     coh = None
 
@@ -76,14 +68,14 @@ def process_gunw(h5path: str, outpath: str) -> dict:
             if isinstance(obj, h5py.Dataset):
                 if "unwrappedPhase" in name and phase is None:
                     phase = obj[:]
-                    print(f"[process] Found phase dataset: {name} shape={obj.shape}", flush=True)
+                    print(f"[process] phase: {name} {obj.shape}", flush=True)
                 if "coherenceMagnitude" in name and coh is None:
                     coh = obj[:]
-                    print(f"[process] Found coherence dataset: {name} shape={obj.shape}", flush=True)
+                    print(f"[process] coherence: {name} {obj.shape}", flush=True)
         f.visititems(find_datasets)
 
     if phase is None:
-        raise ValueError("No unwrappedPhase dataset found in file")
+        raise ValueError("No unwrappedPhase dataset found")
 
     phase = np.array(phase, dtype=np.float32)
     if coh is not None:
@@ -91,7 +83,6 @@ def process_gunw(h5path: str, outpath: str) -> dict:
 
     wavelength_cm = 24.0
     disp = phase * wavelength_cm / (4 * np.pi)
-
     vmin, vmax = np.nanpercentile(disp, [2, 98])
 
     if coh is not None:
@@ -135,39 +126,32 @@ def process_gunw(h5path: str, outpath: str) -> dict:
     }
 
 
-def run_analysis(job_id: str, scene, tmpdir: str, user: str, pwd: str):
-    """Background worker: download + process + save PNG."""
+def run_analysis(job_id, scene, tmpdir, user, pwd):
     try:
         scene_name = scene.properties.get("sceneName", "scene")
-        url = scene.properties.get("url", "")
-        print(f"[job {job_id}] Starting: {scene_name}", flush=True)
-        print(f"[job {job_id}] URL: {url}", flush=True)
+        print(f"[job {job_id}] Start: {scene_name}", flush=True)
 
-        if not url:
-            raise ValueError("Scene has no URL in properties")
+        session = asf.ASFSession()
+        try:
+            session.auth_with_creds(user, pwd)
+            print(f"[job {job_id}] auth_with_creds OK", flush=True)
+        except Exception as auth_e:
+            print(f"[job {job_id}] auth error: {auth_e}", flush=True)
+            raise
 
-        # Download directly with requests + auth
-        h5path = os.path.join(tmpdir, scene_name + ".h5")
-        print(f"[job {job_id}] Downloading via requests...", flush=True)
+        print(f"[job {job_id}] Downloading via scene.download()...", flush=True)
+        files = scene.download(path=tmpdir, session=session)
+        print(f"[job {job_id}] download returned: {files}", flush=True)
 
-        with requests.get(url, auth=(user, pwd), stream=True, timeout=600) as r:
-            print(f"[job {job_id}] HTTP status: {r.status_code}", flush=True)
-            r.raise_for_status()
-            total = 0
-            with open(h5path, "wb") as fout:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        fout.write(chunk)
-                        total += len(chunk)
-                        if total % (50 * 1024 * 1024) < (1024 * 1024):
-                            print(f"[job {job_id}] Downloaded {total / 1e6:.1f} MB", flush=True)
+        if not files:
+            raise RuntimeError("scene.download() returned empty list")
 
-        print(f"[job {job_id}] Download complete: {total / 1e6:.1f} MB", flush=True)
+        h5path = files[0] if isinstance(files, list) else files
+        print(f"[job {job_id}] downloaded to: {h5path}", flush=True)
 
-        # Process
         outpath = os.path.join(tmpdir, "interferogram.png")
         stats = process_gunw(h5path, outpath)
-        print(f"[job {job_id}] Processing done: {stats}", flush=True)
+        print(f"[job {job_id}] done: {stats}", flush=True)
 
         JOBS[job_id]["status"] = "done"
         JOBS[job_id]["image_path"] = outpath
@@ -184,7 +168,6 @@ def run_analysis(job_id: str, scene, tmpdir: str, user: str, pwd: str):
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
-    """Start async analysis. Returns job_id immediately."""
     try:
         point_wkt = f"POINT({req.lon} {req.lat})"
         results = asf.search(
@@ -197,7 +180,7 @@ def analyze(req: AnalyzeRequest):
         )
 
         if not results:
-            return {"error": "No GUNW scenes found for this location and period"}
+            return {"error": "No GUNW scenes found"}
 
         scene = results[0]
         scene_name = scene.properties.get("sceneName", "scene")
@@ -205,7 +188,7 @@ def analyze(req: AnalyzeRequest):
         user = os.getenv("EARTHDATA_USERNAME")
         pwd = os.getenv("EARTHDATA_PASSWORD")
         if not user or not pwd:
-            return {"error": "EARTHDATA_USERNAME / EARTHDATA_PASSWORD not set"}
+            return {"error": "EARTHDATA creds not set"}
 
         tmpdir = tempfile.mkdtemp()
         job_id = str(uuid.uuid4())[:8]
@@ -217,19 +200,13 @@ def analyze(req: AnalyzeRequest):
             "error": None,
         }
 
-        thread = threading.Thread(
+        threading.Thread(
             target=run_analysis,
             args=(job_id, scene, tmpdir, user, pwd),
             daemon=True,
-        )
-        thread.start()
+        ).start()
 
-        return {
-            "job_id": job_id,
-            "status": "processing",
-            "scene_name": scene_name,
-            "message": "Analysis started. Poll /status/{job_id}.",
-        }
+        return {"job_id": job_id, "status": "processing", "scene_name": scene_name}
 
     except Exception as e:
         return {"error": str(e), "trace": traceback.format_exc()}
@@ -237,7 +214,6 @@ def analyze(req: AnalyzeRequest):
 
 @app.get("/status/{job_id}")
 def job_status(job_id: str):
-    """Check status of an analysis job."""
     if job_id not in JOBS:
         raise HTTPException(status_code=404, detail="Job not found")
     job = JOBS[job_id]
@@ -252,7 +228,6 @@ def job_status(job_id: str):
 
 @app.get("/image/{job_id}")
 def job_image(job_id: str):
-    """Return the resulting PNG."""
     if job_id not in JOBS:
         raise HTTPException(status_code=404, detail="Job not found")
     job = JOBS[job_id]
