@@ -1,6 +1,5 @@
 """
-NISAR Backend API v2.2 — uses asf_search for authenticated download,
-with filesystem scan fallback.
+NISAR Backend API v2.3 — async analysis with downsampled rendering.
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -31,7 +30,7 @@ class AnalyzeRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "NISAR Backend", "version": "2.2"}
+    return {"status": "ok", "service": "NISAR Backend", "version": "2.3"}
 
 
 @app.post("/search")
@@ -60,6 +59,7 @@ def search_scenes(req: AnalyzeRequest):
 
 
 def process_gunw(h5path: str, outpath: str) -> dict:
+    """Open GUNW, read phase+coherence, build a downsampled PNG."""
     phase = None
     coh = None
 
@@ -78,18 +78,22 @@ def process_gunw(h5path: str, outpath: str) -> dict:
     if phase is None:
         raise ValueError("No unwrappedPhase dataset found")
 
-    phase = np.array(phase, dtype=np.float32)
+    # Aggressive downsampling: every 3rd pixel (9x memory reduction)
+    STEP = 3
+    phase = np.array(phase[::STEP, ::STEP], dtype=np.float32)
     if coh is not None:
-        coh = np.array(coh, dtype=np.float32)
+        coh = np.array(coh[::STEP, ::STEP], dtype=np.float32)
+
+    print(f"[process] downsampled phase: {phase.shape}", flush=True)
 
     wavelength_cm = 24.0
     disp = phase * wavelength_cm / (4 * np.pi)
     vmin, vmax = np.nanpercentile(disp, [2, 98])
 
     if coh is not None:
-        fig, axes = plt.subplots(1, 3, figsize=(20, 7))
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     else:
-        fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
         axes = list(axes)
 
     ax_idx = 0
@@ -100,9 +104,12 @@ def process_gunw(h5path: str, outpath: str) -> dict:
         plt.colorbar(im0, ax=axes[ax_idx], fraction=0.046)
         ax_idx += 1
 
-    im1 = axes[ax_idx].imshow(phase, cmap="twilight",
-                              vmin=np.nanpercentile(phase, 2),
-                              vmax=np.nanpercentile(phase, 98))
+    im1 = axes[ax_idx].imshow(
+        phase,
+        cmap="twilight",
+        vmin=np.nanpercentile(phase, 2),
+        vmax=np.nanpercentile(phase, 98),
+    )
     axes[ax_idx].set_title("Unwrapped Phase (radians)")
     axes[ax_idx].axis("off")
     plt.colorbar(im1, ax=axes[ax_idx], fraction=0.046)
@@ -114,9 +121,9 @@ def process_gunw(h5path: str, outpath: str) -> dict:
     cb = plt.colorbar(im2, ax=axes[ax_idx], fraction=0.046)
     cb.set_label("displacement, cm")
 
-    plt.suptitle("NISAR GUNW Interferogram", fontsize=14)
+    plt.suptitle("NISAR GUNW Interferogram", fontsize=12)
     plt.tight_layout()
-    plt.savefig(outpath, dpi=120, bbox_inches="tight")
+    plt.savefig(outpath, dpi=100, bbox_inches="tight")
     plt.close(fig)
 
     return {
@@ -147,7 +154,6 @@ def run_analysis(job_id, scene, tmpdir, user, pwd):
             print(f"[job {job_id}] download() raised: {dl_e}", flush=True)
             raise
 
-        # Scan the directory for any downloaded .h5 file
         downloaded_files = [f for f in os.listdir(tmpdir) if f.endswith(".h5")]
         print(f"[job {job_id}] files in {tmpdir}: {downloaded_files}", flush=True)
 
