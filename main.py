@@ -1,9 +1,14 @@
 """
-NISAR Backend API v2.3 — async analysis with downsampled rendering.
+NISAR Backend API v2.5
+- /search: find NISAR scenes
+- /check_regions: batch check availability
+- /analyze: async download+process
+- /status, /image
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from typing import List
 import asf_search as asf
 import h5py
 import numpy as np
@@ -17,7 +22,6 @@ import threading
 import uuid
 
 app = FastAPI(title="NISAR Backend")
-
 JOBS = {}
 
 
@@ -28,9 +32,15 @@ class AnalyzeRequest(BaseModel):
     end_date: str
 
 
+class RegionCheckRequest(BaseModel):
+    regions: List[dict]
+    start_date: str
+    end_date: str
+
+
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "NISAR Backend", "version": "2.3"}
+    return {"status": "ok", "service": "NISAR Backend", "version": "2.5"}
 
 
 @app.post("/search")
@@ -42,49 +52,83 @@ def search_scenes(req: AnalyzeRequest):
             intersectsWith=point_wkt,
             start=f"{req.start_date}T00:00:00Z",
             end=f"{req.end_date}T23:59:59Z",
-            maxResults=10,
+            maxResults=20,
         )
         scenes = []
         for scene in results:
             p = scene.properties
+            # Extract scene center coords from metadata if available
+            lat = p.get("centerLat", req.lat) or req.lat
+            lon = p.get("centerLon", req.lon) or req.lon
             scenes.append({
                 "name": p.get("sceneName", "unknown"),
                 "date": p.get("startTime", "unknown"),
                 "level": p.get("processingLevel", "unknown"),
                 "url": p.get("url", ""),
+                "lat": lat,
+                "lon": lon,
             })
+        # Sort: GUNW first, then by date
+        order = {"GUNW": 0, "RUNW": 1, "GSLC": 2, "GCOV": 3, "RRSD": 4, "SME2": 5}
+        scenes.sort(key=lambda s: (order.get(s.get("level", ""), 99), s.get("date", "")))
         return {"count": len(scenes), "scenes": scenes}
     except Exception as e:
         return {"error": str(e), "trace": traceback.format_exc()}
 
 
+@app.post("/check_regions")
+def check_regions(req: RegionCheckRequest):
+    results = []
+    for region in req.regions:
+        try:
+            point_wkt = f"POINT({region['lon']} {region['lat']})"
+            scenes = asf.search(
+                platform=asf.PLATFORM.NISAR,
+                intersectsWith=point_wkt,
+                start=f"{req.start_date}T00:00:00Z",
+                end=f"{req.end_date}T23:59:59Z",
+                maxResults=5,
+            )
+            results.append({
+                "name": region.get("name", "unknown"),
+                "lat": region["lat"],
+                "lon": region["lon"],
+                "count": len(scenes),
+                "available": len(scenes) > 0,
+                "levels": list({s.properties.get("processingLevel", "?") for s in scenes}),
+            })
+        except Exception as e:
+            results.append({
+                "name": region.get("name", "unknown"),
+                "lat": region["lat"],
+                "lon": region["lon"],
+                "count": 0,
+                "available": False,
+                "error": str(e),
+            })
+    return {"results": results}
+
+
 def process_gunw(h5path: str, outpath: str) -> dict:
-    """Open GUNW, read phase+coherence, build a downsampled PNG."""
     phase = None
     coh = None
-
     with h5py.File(h5path, "r") as f:
         def find_datasets(name, obj):
             nonlocal phase, coh
             if isinstance(obj, h5py.Dataset):
                 if "unwrappedPhase" in name and phase is None:
                     phase = obj[:]
-                    print(f"[process] phase: {name} {obj.shape}", flush=True)
                 if "coherenceMagnitude" in name and coh is None:
                     coh = obj[:]
-                    print(f"[process] coherence: {name} {obj.shape}", flush=True)
         f.visititems(find_datasets)
 
     if phase is None:
         raise ValueError("No unwrappedPhase dataset found")
 
-    # Aggressive downsampling: every 3rd pixel (9x memory reduction)
     STEP = 3
     phase = np.array(phase[::STEP, ::STEP], dtype=np.float32)
     if coh is not None:
         coh = np.array(coh[::STEP, ::STEP], dtype=np.float32)
-
-    print(f"[process] downsampled phase: {phase.shape}", flush=True)
 
     wavelength_cm = 24.0
     disp = phase * wavelength_cm / (4 * np.pi)
@@ -104,12 +148,9 @@ def process_gunw(h5path: str, outpath: str) -> dict:
         plt.colorbar(im0, ax=axes[ax_idx], fraction=0.046)
         ax_idx += 1
 
-    im1 = axes[ax_idx].imshow(
-        phase,
-        cmap="twilight",
-        vmin=np.nanpercentile(phase, 2),
-        vmax=np.nanpercentile(phase, 98),
-    )
+    im1 = axes[ax_idx].imshow(phase, cmap="twilight",
+                              vmin=np.nanpercentile(phase, 2),
+                              vmax=np.nanpercentile(phase, 98))
     axes[ax_idx].set_title("Unwrapped Phase (radians)")
     axes[ax_idx].axis("off")
     plt.colorbar(im1, ax=axes[ax_idx], fraction=0.046)
@@ -138,44 +179,25 @@ def run_analysis(job_id, scene, tmpdir, user, pwd):
     try:
         scene_name = scene.properties.get("sceneName", "scene")
         print(f"[job {job_id}] Start: {scene_name}", flush=True)
-
         session = asf.ASFSession()
-        try:
-            session.auth_with_creds(user, pwd)
-            print(f"[job {job_id}] auth_with_creds OK", flush=True)
-        except Exception as auth_e:
-            print(f"[job {job_id}] auth error: {auth_e}", flush=True)
-            raise
-
-        print(f"[job {job_id}] Downloading via scene.download()...", flush=True)
-        try:
-            scene.download(path=tmpdir, session=session)
-        except Exception as dl_e:
-            print(f"[job {job_id}] download() raised: {dl_e}", flush=True)
-            raise
-
-        downloaded_files = [f for f in os.listdir(tmpdir) if f.endswith(".h5")]
-        print(f"[job {job_id}] files in {tmpdir}: {downloaded_files}", flush=True)
-
-        if not downloaded_files:
-            raise RuntimeError(f"No .h5 file found in {tmpdir} after download")
-
-        h5path = os.path.join(tmpdir, downloaded_files[0])
-        print(f"[job {job_id}] using file: {h5path}", flush=True)
-
+        session.auth_with_creds(user, pwd)
+        print(f"[job {job_id}] auth OK", flush=True)
+        scene.download(path=tmpdir, session=session)
+        files = [f for f in os.listdir(tmpdir) if f.endswith(".h5")]
+        print(f"[job {job_id}] files: {files}", flush=True)
+        if not files:
+            raise RuntimeError("No .h5 downloaded")
+        h5path = os.path.join(tmpdir, files[0])
         outpath = os.path.join(tmpdir, "interferogram.png")
         stats = process_gunw(h5path, outpath)
         print(f"[job {job_id}] done: {stats}", flush=True)
-
         JOBS[job_id]["status"] = "done"
         JOBS[job_id]["image_path"] = outpath
-        JOBS[job_id]["scene_name"] = scene_name
         JOBS[job_id]["stats"] = stats
-
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         print(f"[job {job_id}] ERROR: {err}", flush=True)
-        print(f"[job {job_id}] TRACE: {traceback.format_exc()}", flush=True)
+        print(traceback.format_exc(), flush=True)
         JOBS[job_id]["status"] = "error"
         JOBS[job_id]["error"] = err
 
@@ -192,36 +214,18 @@ def analyze(req: AnalyzeRequest):
             processingLevel="GUNW",
             maxResults=1,
         )
-
         if not results:
-            return {"error": "No GUNW scenes found"}
-
+            return {"error": "No GUNW scenes for this location and period"}
         scene = results[0]
-        scene_name = scene.properties.get("sceneName", "scene")
-
         user = os.getenv("EARTHDATA_USERNAME")
         pwd = os.getenv("EARTHDATA_PASSWORD")
         if not user or not pwd:
             return {"error": "EARTHDATA creds not set"}
-
         tmpdir = tempfile.mkdtemp()
         job_id = str(uuid.uuid4())[:8]
-
-        JOBS[job_id] = {
-            "status": "processing",
-            "scene_name": scene_name,
-            "image_path": None,
-            "error": None,
-        }
-
-        threading.Thread(
-            target=run_analysis,
-            args=(job_id, scene, tmpdir, user, pwd),
-            daemon=True,
-        ).start()
-
-        return {"job_id": job_id, "status": "processing", "scene_name": scene_name}
-
+        JOBS[job_id] = {"status": "processing", "image_path": None, "error": None}
+        threading.Thread(target=run_analysis, args=(job_id, scene, tmpdir, user, pwd), daemon=True).start()
+        return {"job_id": job_id, "status": "processing", "scene_name": scene.properties.get("sceneName", "scene")}
     except Exception as e:
         return {"error": str(e), "trace": traceback.format_exc()}
 
@@ -231,13 +235,7 @@ def job_status(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(status_code=404, detail="Job not found")
     job = JOBS[job_id]
-    return {
-        "job_id": job_id,
-        "status": job["status"],
-        "scene_name": job.get("scene_name"),
-        "error": job.get("error"),
-        "stats": job.get("stats"),
-    }
+    return {"job_id": job_id, "status": job["status"], "error": job.get("error"), "stats": job.get("stats")}
 
 
 @app.get("/image/{job_id}")
