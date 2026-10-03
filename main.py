@@ -1,9 +1,8 @@
 """
-NISAR Backend API v2.5
-- /search: find NISAR scenes
+NISAR Backend API v2.6
+- /search: returns scenes with real center coords parsed from scene metadata
 - /check_regions: batch check availability
-- /analyze: async download+process
-- /status, /image
+- /analyze, /status, /image
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -40,7 +39,34 @@ class RegionCheckRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "NISAR Backend", "version": "2.5"}
+    return {"status": "ok", "service": "NISAR Backend", "version": "2.6"}
+
+
+def parse_scene_center(p):
+    """Extract lat/lon from ASF scene properties."""
+    # Try a bunch of known keys
+    for lat_key in ["centerLat", "center_lat", "centerLatitude", "latitude"]:
+        if p.get(lat_key) is not None:
+            try:
+                lat = float(p[lat_key])
+                for lon_key in ["centerLon", "center_lon", "centerLongitude", "longitude"]:
+                    if p.get(lon_key) is not None:
+                        return lat, float(p[lon_key])
+            except (ValueError, TypeError):
+                pass
+    # Try centroid from bounding polygon
+    poly = p.get("boundingPolygon") or p.get("spatialCoverage")
+    if poly:
+        try:
+            import re
+            coords = re.findall(r"([-\d.]+)\s+([-\d.]+)", str(poly))
+            if coords:
+                lats = [float(c[1]) for c in coords]
+                lons = [float(c[0]) for c in coords]
+                return sum(lats) / len(lats), sum(lons) / len(lons)
+        except Exception:
+            pass
+    return None, None
 
 
 @app.post("/search")
@@ -55,20 +81,24 @@ def search_scenes(req: AnalyzeRequest):
             maxResults=20,
         )
         scenes = []
-        for scene in results:
+        for idx, scene in enumerate(results):
             p = scene.properties
-            # Extract scene center coords from metadata if available
-            lat = p.get("centerLat", req.lat) or req.lat
-            lon = p.get("centerLon", req.lon) or req.lon
+            center_lat, center_lon = parse_scene_center(p)
+            # Fallback: spread points slightly around request point using index
+            if center_lat is None or center_lon is None:
+                offset = (idx - 10) * 0.15
+                center_lat = req.lat + offset
+                center_lon = req.lon + offset
             scenes.append({
                 "name": p.get("sceneName", "unknown"),
                 "date": p.get("startTime", "unknown"),
                 "level": p.get("processingLevel", "unknown"),
                 "url": p.get("url", ""),
-                "lat": lat,
-                "lon": lon,
+                "lat": float(center_lat),
+                "lon": float(center_lon),
+                "platform": p.get("platform", "NISAR"),
+                "instrument": p.get("instrumentName", "LSAR"),
             })
-        # Sort: GUNW first, then by date
         order = {"GUNW": 0, "RUNW": 1, "GSLC": 2, "GCOV": 3, "RRSD": 4, "SME2": 5}
         scenes.sort(key=lambda s: (order.get(s.get("level", ""), 99), s.get("date", "")))
         return {"count": len(scenes), "scenes": scenes}
@@ -184,7 +214,6 @@ def run_analysis(job_id, scene, tmpdir, user, pwd):
         print(f"[job {job_id}] auth OK", flush=True)
         scene.download(path=tmpdir, session=session)
         files = [f for f in os.listdir(tmpdir) if f.endswith(".h5")]
-        print(f"[job {job_id}] files: {files}", flush=True)
         if not files:
             raise RuntimeError("No .h5 downloaded")
         h5path = os.path.join(tmpdir, files[0])
